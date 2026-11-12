@@ -1,7 +1,7 @@
 # UAP Students — Midterm Grades & Study Habits
 
 Streamlit app with a descriptive statistics report and parametric / non-parametric
-hypothesis tests based on a survey of 56 UAP students.
+hypothesis tests based on a survey of UAP students, plus a prediction model (Ridge regression and Random Forest) for the previous-semester GPA.
 
 ## Run locally
 ```

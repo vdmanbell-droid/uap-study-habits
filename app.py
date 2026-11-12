@@ -104,13 +104,15 @@ def first_number(x):
 @st.cache_data
 def load_data(path):
     raw = pd.read_excel(path)
-    raw.columns = [str(c).replace("\xa0", " ").strip() for c in raw.columns]
+    raw.columns = [str(c).replace("\xa0", " ").strip().lstrip("¿¡ ") for c in raw.columns]
 
     df = pd.DataFrame()
     for key, prefix in QUESTIONS.items():
         match = [c for c in raw.columns if c.startswith(prefix)]
-        df[key] = raw[match[0]].values
-    df.insert(0, "id", raw["ID"].values)
+        # if the form repeats a question, keep the first non-empty answer
+        df[key] = raw[match].bfill(axis=1).iloc[:, 0].values
+    id_col = next((c for c in raw.columns if c.lower() == "id"), None)
+    df.insert(0, "id", raw[id_col].values if id_col else np.arange(1, len(raw) + 1))
 
     notes = []
 
@@ -122,19 +124,21 @@ def load_data(path):
     df["midterm"] = pd.to_numeric(df["midterm"], errors="coerce")
 
     # Previous GPA: 0 means no previous semester (first-semester students)
+    df["gpa_prev"] = df["gpa_prev"].apply(first_number)
     zero_gpa = (df["gpa_prev"] == 0).sum()
     if zero_gpa:
         notes.append(f"{zero_gpa} previous GPA of 0 (no previous semester) → treated as missing.")
     df.loc[df["gpa_prev"] == 0, "gpa_prev"] = np.nan
 
     # Free-text numeric answers
-    for col in ["courses", "scholarship_hours"]:
+    for col in ["semester", "courses", "study_hours_day", "study_days_week", "days_in_advance", "preparation",
+                "work_hours", "interference", "scholarship_hours", "satisfaction", "difficulty"]:
         df[col] = df[col].apply(first_number)
     notes.append("Free-text numbers cleaned ('9 courses' → 9, '40 hours' → 40, '50 ' → 50).")
 
     # Scholarship hours only make sense for students in a scholarship program
     df["in_scholarship"] = np.where(
-        df["program"].str.contains("scholarship|both", case=False), "Yes", "No"
+        df["program"].astype(str).str.contains("scholarship|both", case=False, na=False), "Yes", "No"
     )
     df.loc[df["in_scholarship"] == "No", "scholarship_hours"] = np.nan
 
@@ -221,6 +225,7 @@ def ml_data(data):
     d["schol_b"] = (d["in_scholarship"] == "Yes").astype(int)
     d["scholarship_hours"] = d["scholarship_hours"].fillna(0)
     d["sleep_n"] = d["sleep"].cat.codes.replace(-1, np.nan) + 1
+    d["method"] = d["method"].fillna(d["method"].mode().iloc[0])
     d = d.reset_index(drop=True)
     return {"d": d, "X": d[ML_NUM + ML_CAT], "y": d["gpa_prev"].astype(float)}
 
@@ -294,8 +299,6 @@ def describe_numeric(data, cols):
         q1, q3 = s.quantile([0.25, 0.75])
         rows.append({
             "Variable": lab(c),
-            "n": len(s),
-            "Missing": data[c].isna().sum(),
             "Mean": s.mean(),
             "Std. dev.": s.std(),
             "Min": s.min(),
@@ -446,7 +449,6 @@ page = st.sidebar.radio(
 )
 alpha = st.sidebar.select_slider("Significance level (α)", [0.01, 0.05, 0.10], value=0.05)
 st.sidebar.divider()
-st.sidebar.markdown(f"**Sample size:** {len(df)} students")
 st.sidebar.markdown(f"**Collection date:** {pd.Timestamp('2026-10-22').strftime('%b %Y')}")
 st.sidebar.markdown("**Tools:** Python · pandas · SciPy · scikit-learn · Plotly")
 
@@ -463,8 +465,7 @@ if page == "Overview":
         "report**, (2) the **parametric (Unit 3) and non-parametric (Unit 4) hypothesis tests** of the course, and (3) a **prediction model** (Ridge regression and Random Forest) for the previous-semester GPA, with visual results."
     )
 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Respondents", len(df))
+    k2, k3, k4, k5 = st.columns(4)
     k2.metric("Mean midterm grade", f"{df['midterm'].mean():.2f}")
     k3.metric("Mean previous GPA", f"{df['gpa_prev'].mean():.2f}")
     k4.metric("Have a job", f"{(df['job'] == 'Yes').mean():.0%}")
@@ -530,7 +531,7 @@ elif page == "Descriptive statistics":
     with t1:
         st.subheader("Measures of central tendency, dispersion and shape")
         desc = describe_numeric(df, NUMERIC)
-        st.dataframe(desc.style.format("{:.2f}", subset=desc.columns[2:]), width="stretch")
+        st.dataframe(desc.style.format("{:.2f}", subset=desc.columns), width="stretch")
         st.caption(
             "CV = coefficient of variation. Skewness > 0 → long right tail; < 0 → long left tail. "
             "Kurtosis is excess kurtosis (0 = normal)."
@@ -542,8 +543,8 @@ elif page == "Descriptive statistics":
 **Highlights**
 - The average midterm grade is **{m.mean():.2f}** (median {m.median():.2f}, SD {m.std():.2f}); grades range from {m.min():.1f} to {m.max():.1f}.
 - The previous-semester GPA averages **{g.mean():.2f}** (SD {g.std():.2f}), a little higher than the midterm grade.
-- Students study a median of **{df['study_hours_day'].median():.0f} h/day** on **{df['study_days_week'].median():.0f} days/week**; {(df['study_hours_day'] == 0).sum()} students report 0 h/day.
-- Work hours and scholarship hours are strongly right-skewed: most students don't work, while a few work 30–55 h/week.
+- Students study a median of **{df['study_hours_day'].median():.0f} h/day** on **{df['study_days_week'].median():.0f} days/week**; {(df['study_hours_day'] == 0).mean():.0%} of students report 0 h/day.
+- Work hours and scholarship hours are strongly right-skewed: most students don't work, while a few work up to {df['work_hours'].max():.0f} h/week.
 """
         )
 
@@ -722,7 +723,7 @@ elif page == "Hypothesis testing":
             main_dist, main_stat, main_name, main_p = stats.norm(), z, "z", p_z
         st.dataframe(result_table(rows), hide_index=True, width="stretch")
         ci = stats.t.interval(1 - alpha, n - 1, xbar, sd / np.sqrt(n))
-        st.markdown(f"n = {n} · x̄ = **{xbar:.3f}** · s = {sd:.3f} · {int((1 - alpha) * 100)}% confidence interval for μ: "
+        st.markdown(f"x̄ = **{xbar:.3f}** · s = {sd:.3f} · {int((1 - alpha) * 100)}% confidence interval for μ: "
                     f"**[{ci[0]:.3f}, {ci[1]:.3f}]**")
         ks_caption([(lab(v), s)], alpha)
 
@@ -830,7 +831,7 @@ elif page == "Hypothesis testing":
         st.markdown(f"**H₀:** σ²({lv[0]}) = σ²({lv[1]})  ·  **H₁:** σ²({lv[0]}) {ALT_SIGN[alt2]} σ²({lv[1]})")
         st.dataframe(result_table([("F test for two variances", "Parametric", f"F = {F:.3f}, df = ({n1 - 1}, {n2 - 1})", fmt_p(p_f), decision(p_f, alpha))]),
                      hide_index=True, width="stretch")
-        st.markdown(f"s²({lv[0]}) = {a.var():.4f} (n = {n1}) · s²({lv[1]}) = {b.var():.4f} (n = {n2})")
+        st.markdown(f"s²({lv[0]}) = {a.var():.4f} · s²({lv[1]}) = {b.var():.4f}")
         c1, c2 = st.columns(2)
         fig = px.box(sub, x=g, y=y, color=g, points="all", category_orders={g: lv}, labels={g: lab(g), y: lab(y)})
         fig.update_layout(showlegend=False, height=380, title="Spread by group")
@@ -865,7 +866,7 @@ elif page == "Hypothesis testing":
                      hide_index=True, width="stretch")
         zc = stats.norm.ppf(1 - alpha / 2)
         half = zc * np.sqrt(ph * (1 - ph) / n)
-        st.markdown(f"{k} of {n} students · p̂ = **{ph:.3f}** · {int((1 - alpha) * 100)}% CI for p: "
+        st.markdown(f"p̂ = **{ph:.3f}** · {int((1 - alpha) * 100)}% CI for p: "
                     f"**[{max(ph - half, 0):.3f}, {min(ph + half, 1):.3f}]**")
         if n * p0 < 5 or n * (1 - p0) < 5:
             st.warning("n·p₀ or n·(1 − p₀) is below 5: the normal approximation may not be valid.")
@@ -980,7 +981,7 @@ elif page == "Hypothesis testing":
         st.markdown(f"**H₀:** {h0}  ·  **H₁:** {h1}")
         n_pos, n_neg, ties, p_b, z, p_z = sign_test(diff, alt)
         st.dataframe(result_table([
-            ("Sign test (exact binomial)", "Non-parametric", f"n₊ = {n_pos}, n₋ = {n_neg}, n = {n_pos + n_neg}", fmt_p(p_b), decision(p_b, alpha)),
+            ("Sign test (exact binomial)", "Non-parametric", f"n₊ = {n_pos}, n₋ = {n_neg}", fmt_p(p_b), decision(p_b, alpha)),
             ("Sign test (normal approximation)", "Non-parametric", f"z = {z:.3f}", fmt_p(p_z), decision(p_z, alpha)),
         ]), hide_index=True, width="stretch")
         st.caption(f"{ties} tie(s) discarded.")
@@ -1025,7 +1026,7 @@ elif page == "Hypothesis testing":
         st.markdown(f"**H₀:** {h0}  ·  **H₁:** {h1}")
         d, r, w_pos, w_neg, n, z, p_w = signed_rank(diff, alt)
         st.dataframe(result_table([
-            ("Wilcoxon signed-rank", "Non-parametric", f"W₊ = {w_pos:.1f}, W₋ = {w_neg:.1f}, n = {n}", fmt_p(p_w), decision(p_w, alpha)),
+            ("Wilcoxon signed-rank", "Non-parametric", f"W₊ = {w_pos:.1f}, W₋ = {w_neg:.1f}", fmt_p(p_w), decision(p_w, alpha)),
             ("Normal approximation", "Non-parametric", f"z = {z:.3f}", fmt_p(p_from_dist(stats.norm(), z, alt)),
              decision(p_from_dist(stats.norm(), z, alt), alpha)),
         ]), hide_index=True, width="stretch")
@@ -1064,7 +1065,7 @@ elif page == "Hypothesis testing":
             ("Wilcoxon rank-sum", "Non-parametric", f"W = R₁ = {r1:.1f}, z = {rsz.statistic:.3f}", fmt_p(rsz.pvalue), decision(rsz.pvalue, alpha)),
             ("Mann–Whitney U", "Non-parametric", f"U = {u:.1f}", fmt_p(mw.pvalue), decision(mw.pvalue, alpha)),
         ]), hide_index=True, width="stretch")
-        st.caption(f"Mean rank '{lv[0]}' = {r1 / n1:.1f} (n = {n1}) · mean rank '{lv[1]}' = {ranks[n1:].mean():.1f} (n = {n2}). "
+        st.caption(f"Mean rank '{lv[0]}' = {r1 / n1:.1f} · mean rank '{lv[1]}' = {ranks[n1:].mean():.1f}. "
                    "Mann–Whitney p-value includes the tie correction.")
         rk = pd.DataFrame({g: [lv[0]] * n1 + [lv[1]] * n2, "Rank": ranks, y: np.r_[a.to_numpy(), b.to_numpy()]})
         c1, c2 = st.columns(2)
@@ -1159,7 +1160,7 @@ elif page == "Hypothesis testing":
         D, p_k = ks_normal(x, mu_, sd_)
         n = len(x)
         st.markdown(f"**H₀:** {lab(v).lower()} ~ Normal(μ = {mu_:.3f}, σ = {sd_:.3f})")
-        st.dataframe(result_table([("Kolmogorov–Smirnov", "Non-parametric", f"D = {D:.4f}, n = {n}, critical value ≈ {stats.kstwo.ppf(1 - alpha, n):.4f}",
+        st.dataframe(result_table([("Kolmogorov–Smirnov", "Non-parametric", f"D = {D:.4f}, critical value ≈ {stats.kstwo.ppf(1 - alpha, n):.4f}",
                                     fmt_p(p_k), decision(p_k, alpha))]), hide_index=True, width="stretch")
         F_ = stats.norm.cdf(x, mu_, sd_)
         ecdf_hi = np.arange(1, n + 1) / n
@@ -1182,7 +1183,7 @@ elif page == "Hypothesis testing":
         for c in NUMERIC:
             Dc, pc = ks_normal(df[c])
             if not np.isnan(pc):
-                allks.append({"Variable": lab(c), "n": int(df[c].notna().sum()), "D": Dc, "p-value": pc,
+                allks.append({"Variable": lab(c), "D": Dc, "p-value": pc,
                               "Normal?": "Yes" if pc >= alpha else "No"})
         st.dataframe(pd.DataFrame(allks).style.format({"D": "{:.4f}", "p-value": "{:.4f}"}),
                      hide_index=True, width="stretch")
@@ -1227,28 +1228,27 @@ elif page == "Prediction model":
 
     # ---------------- Data and method
     with t1:
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Students used", len(yall))
+        k2, k3, k4 = st.columns(3)
         k2.metric("Predictors", len(ML_NUM) + 1)
         k3.metric("Mean previous GPA", f"{yall.mean():.2f}")
         k4.metric("Std. dev.", f"{yall.std():.2f}")
-        st.markdown("**Target (y):** previous-semester GPA. The student with GPA = 0 (no previous semester) is excluded.")
+        st.markdown("**Target (y):** previous-semester GPA. Students with GPA = 0 (no previous semester) are excluded.")
         st.markdown("**Predictors (X):**")
         st.dataframe(pd.DataFrame({
             "Variable": [ML_LABELS[c] for c in ML_NUM] + ["Main study method"],
             "Type": ["Numeric" if c not in ("job_b", "schol_b") else "Binary (0/1)" for c in ML_NUM] + ["Categorical (one-hot)"],
         }), hide_index=True, width="stretch")
         st.markdown(
-            """
+            f"""
 **Pipeline (same for both models)**
 1. Missing values (one midterm grade) → replaced by the median.
 2. Numeric variables → standardized (mean 0, SD 1), so Ridge penalizes all coefficients fairly.
 3. Study method → one-hot encoding (one 0/1 column per method).
 4. Model: Ridge regression or Random Forest.
 
-**Validation.** With only 55 students, a single train/test split would be unreliable, so performance is
+**Validation.** With a small sample, a single train/test split would be unreliable, so performance is
 measured with **repeated 5-fold cross-validation** (5 folds × 3 repetitions = 15 train/test splits).
-In each split the model is trained on ~44 students and evaluated on the ~11 it has never seen.
+In each split the model is trained on 80% of the students and evaluated on the other 20%, which it has never seen.
 """
         )
         st.caption("Note: the midterm grade happens after the previous semester; here it is used as information "
@@ -1303,7 +1303,7 @@ In each split the model is trained on ~44 students and evaluated on the ~11 it h
         fig.add_vline(R["alpha"], line_dash="dash", line_color=PALETTE[1], annotation_text=f"α used = {R['alpha']:.1f}")
         fig.update_layout(height=340)
         st.plotly_chart(fig, width="stretch")
-        st.caption("Small α ≈ ordinary least squares (overfits with 20 predictor columns and 55 students); "
+        st.caption(f"Small α ≈ ordinary least squares (overfits with {len(R['coef'])} predictor columns and a small sample); "
                    "very large α shrinks every coefficient to 0 (≈ predicting the mean). The best α is in between.")
 
     # ---------------- Drivers
@@ -1321,8 +1321,10 @@ In each split the model is trained on ~44 students and evaluated on the ~11 it h
         c2.plotly_chart(fig, width="stretch")
         top_r = R["coef"].abs().sort_values(ascending=False).index[:3].tolist()
         top_f = R["imp"].sort_values(ascending=False).index[:3].tolist()
-        st.success(f"**Ridge** relies most on: {', '.join(top_r)}. **Random Forest** relies most on: {', '.join(top_f)}. "
-                   "Both agree that the **midterm grade** is the strongest signal of a student's previous GPA.")
+        agree = (f"Both agree that **{top_r[0]}** is the strongest signal of a student's previous GPA."
+                 if top_r[0] == top_f[0] else
+                 f"Ridge's strongest signal is **{top_r[0]}**; Random Forest's is **{top_f[0]}**.")
+        st.success(f"**Ridge** relies most on: {', '.join(top_r)}. **Random Forest** relies most on: {', '.join(top_f)}. " + agree)
         st.caption("Ridge coefficients are in standardized units: blue raises the predicted GPA, red lowers it. "
                    "Random Forest importance has no sign; it shows how much each variable helps the trees split.")
 
@@ -1401,20 +1403,21 @@ In each split the model is trained on ~44 students and evaluated on the ~11 it h
     with t5:
         pf = R["perf"].set_index("Model")
         bm = "Random Forest" if pf.loc["Random Forest", "RMSE (mean)"] <= pf.loc["Ridge", "RMSE (mean)"] else "Ridge"
+        imp_s = R["imp"].sort_values(ascending=False)
+        coef_s = R["coef"].abs().sort_values(ascending=False)
         om = "Ridge" if bm == "Random Forest" else "Random Forest"
         st.markdown(
             f"""
 - **{bm}** is the best model with these settings: cross-validated RMSE **{pf.loc[bm, 'RMSE (mean)']:.3f}** and R² **{pf.loc[bm, 'R² (mean)']:.2f}**,
   versus {om} RMSE **{pf.loc[om, 'RMSE (mean)']:.3f}** (R² {pf.loc[om, 'R² (mean)']:.2f}) and the baseline RMSE **{pf.loc['Baseline (mean)', 'RMSE (mean)']:.3f}**.
 - Both models beat the baseline, but they explain only a **modest share** of the variation: the typical error is about
-  half a GPA point. Grades depend on many things the survey does not measure.
-- The **midterm grade** is by far the strongest predictor (students keep a similar level across periods). Courses taken,
-  scholarship hours and satisfaction add some information; daily study hours, sleep and having a job add very little,
-  which matches the hypothesis tests.
-- Ridge needed a strong penalty (α ≈ {R['alpha']:.0f}): with 20 predictor columns and 55 students, an unpenalized regression would overfit.
-- Random Forest works best with at least 5 students per leaf; deeper trees memorize the training data.
+  ±{pf.loc[bm, 'RMSE (mean)']:.2f} GPA points. Grades depend on many things the survey does not measure.
+- The strongest predictor in the Random Forest is **{imp_s.index[0]}** (Ridge: **{coef_s.index[0]}**). Next come
+  {", ".join(imp_s.index[1:4])}; the variables that add the least are {", ".join(imp_s.index[-3:])}.
+- Ridge needed a strong penalty (α ≈ {R['alpha']:.0f}): with {len(R['coef'])} predictor columns and a small sample, an unpenalized regression would overfit.
+- Random Forest generalizes better with a minimum number of students per leaf (default 5); very deep trees memorize the training data.
 
-**Limitations and next steps:** small sample (n = 55), self-reported grades, and only one period. More students, official
+**Limitations and next steps:** small sample, self-reported grades, and only one period. More students, official
 grades and variables such as previous-year GPA or study-skills scores would improve the predictions.
 """
         )
@@ -1455,7 +1458,7 @@ elif page == "Conclusions":
     p2s = sign_test(d, "two-sided")[3]
     p2w = signed_rank(d, "two-sided")[6]
     add("Q2. Midterm grade vs previous GPA (paired)", "t test on differences", p2,
-        f"Sign test ({p_eq(p2s)}); Wilcoxon signed-rank", p2w, f"mean change {d.mean():+.2f}; {int((d < 0).sum())} of {len(d)} dropped")
+        f"Sign test ({p_eq(p2s)}); Wilcoxon signed-rank", p2w, f"mean change {d.mean():+.2f}; {(d < 0).mean():.0%} dropped")
     # Q3 job
     a = df.loc[df["job"] == "Yes", "midterm"].dropna()
     b = df.loc[df["job"] == "No", "midterm"].dropna()
@@ -1519,17 +1522,42 @@ elif page == "Conclusions":
     st.caption("Bars that pass the dashed line are statistically significant.")
 
     st.subheader("Interpretation")
+
+    def evid(tests):
+        rej = [n for n, p in tests.items() if p < alpha]
+        keep = [n for n, p in tests.items() if p >= alpha]
+        detail = ", ".join(f"{n} {p_eq(p)}" for n, p in tests.items())
+        if not keep:
+            return "significant", f"all tests agree ({detail})"
+        if not rej:
+            return "not significant", f"no test rejects H₀ ({detail})"
+        return "mixed", f"significant with {', '.join(rej)} but not with {', '.join(keep)} ({detail})"
+
+    v1, e1 = evid({"t test": p1, "sign test": p1s})
+    v2, e2 = evid({"t test": p2, "sign test": p2s, "Wilcoxon signed-rank": p2w})
+    v3, e3 = evid({"pooled/Welch t": tt.pvalue, "Wilcoxon rank-sum": p3w})
+    v4, e4 = evid({"ANOVA": p4})
+    v5, e5 = evid({"χ² variance test": p5})
+    v6, e6 = evid({"Z test": p6})
+    v7, e7 = evid({"χ² goodness of fit": p7c, "Kolmogorov–Smirnov": p7k})
+    v8, e8 = evid({"χ² goodness of fit": p8})
+    top2 = cnt.index[:2].tolist()
     st.markdown(
         f"""
-- **Level of grades:** the mean midterm grade ({m.mean():.2f}) is significantly above 8.0 (t test and sign test).
+- **Level of grades:** the mean midterm grade is {m.mean():.2f}; being above 8.0 is **{v1}** — {e1}.
 - **Change vs previous semester:** grades were on average **{abs(d.mean()):.2f} points {'lower' if d.mean() < 0 else 'higher'}**
-  than the previous GPA; {int((d < 0).sum())} of {len(d)} students dropped (t test on differences, sign test, Wilcoxon signed-rank).
-- **Job and sleep:** having a job (pooled t, Wilcoxon rank-sum) and sleep quality (ANOVA) show **no significant differences** in grades.
-- **Spread and habits:** grades are concentrated (s = {m.std():.2f}); {ph:.0%} of students study 2+ hours per day.
-- **Distributions:** practice exercises and notes dominate the study methods; normality of grades is checked with the χ² and K–S
-  goodness-of-fit tests, which is why each parametric test is paired with a non-parametric alternative.
+  than the previous GPA ({(d < 0).mean():.0%} of students dropped). The change is **{v2}** — {e2}.
+- **Having a job:** mean grade {a.mean():.2f} for students who work vs {b.mean():.2f} for those who don't; the difference is **{v3}** — {e3}.
+- **Sleep quality:** group means {" / ".join(f"{g_.mean():.2f}" for g_ in gr)} (bad / normal / good); the difference is **{v4}** — {e4}.
+- **Spread:** grades are concentrated (s = {m.std():.2f}); σ below 1 is **{v5}** — {e5}.
+- **Study time:** {ph:.0%} of students study 2+ hours per day; "fewer than half" is **{v6}** — {e6}.
+- **Distributions:** midterm grades departing from normality is **{v7}** — {e7}. The most used study methods are
+  {top2[0].lower()} and {top2[1].lower()}; unequal popularity is **{v8}** — {e8}.
 
-**Limitations.** Small voluntary sample (n = {len(df)}), self-reported grades, small groups for some categories,
+When a parametric and a non-parametric test disagree, the non-parametric result is the safer one here, because most
+variables are not normal.
+
+**Limitations.** Small voluntary sample, self-reported grades, small groups for some categories,
 and K–S with estimated parameters is only approximate.
 """
     )
